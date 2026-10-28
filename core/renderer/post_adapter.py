@@ -42,6 +42,9 @@ class QzonePostCardAdapter:
         return result
 
     async def _resolve_avatar(self, post: Post) -> Path | None:
+        if post.anon:
+            return None
+
         if post.avatar_url:
             avatar_path = await self.fetcher.fetch_url_to_cache(
                 post.avatar_url,
