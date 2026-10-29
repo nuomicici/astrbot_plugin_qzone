@@ -28,7 +28,6 @@ class LLMAction:
     def __init__(self, config: PluginConfig):
         self.cfg = config
         self.context = config.context
-        self._prompt_has_time = False
 
     @staticmethod
     def _join_prompt_parts(*parts: str) -> str:
@@ -279,26 +278,29 @@ class LLMAction:
 
     def _build_task_prompt(
         self, scene: str, scene_prompt: str, extra: str = ""
-    ) -> str:
+    ) -> tuple[str, bool]:
         """
         统合提示词：[全局主提示词] + [当前场景独立提示词] + [可选场景附加要求]
         每个场景只替换自己的独立提示词，主提示词始终共享。
+        返回 (task_prompt, has_time_placeholder)
         """
-        self._prompt_has_time = any(
+        has_time = any(
             TIME_PLACEHOLDER in (part or "")
             for part in (self.cfg.llm.main_prompt, scene_prompt, extra)
         )
-        return self._join_prompt_parts(
+        task_prompt = self._join_prompt_parts(
             self._render_prompt(self.cfg.llm.main_prompt, scene),
             self._render_prompt(scene_prompt, scene),
             self._render_prompt(extra, scene),
         )
+        return task_prompt, has_time
 
     async def _build_request_context(
         self,
         *,
         event: Any | None,
         task_prompt: str,
+        prompt_has_time: bool = False,
         contexts: list[dict[str, Any]] | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
         persona_prompt, persona_contexts = await self._get_persona_context(event)
@@ -306,8 +308,13 @@ class LLMAction:
             "# Persona Instructions\n\n" + persona_prompt if persona_prompt else "",
             task_prompt,
         ]
-        # 提示词里已经有时间占位符时不再追加，避免当前时间被重复声明
-        if not self._prompt_has_time:
+        # 提示词里已经有时间占位符或显式包含当前时间段落时不再追加，避免当前时间被重复声明
+        has_time = (
+            prompt_has_time
+            or "# 当前时间" in task_prompt
+            or (persona_prompt and TIME_PLACEHOLDER in persona_prompt)
+        )
+        if not has_time:
             parts.append(f"# 当前时间\n{self.cfg.now_str()}")
         system_prompt = self._join_prompt_parts(*parts)
         merged_contexts = [*persona_contexts]
@@ -346,7 +353,7 @@ class LLMAction:
             return None
         # TODO: 更多模式
 
-        task_prompt = self._build_task_prompt(
+        task_prompt, has_time = self._build_task_prompt(
             SCENE_POST,
             self.cfg.llm.post_prompt,
             f"# 写作主题：{topic or '从聊天内容中选一个主题'}",
@@ -360,6 +367,7 @@ class LLMAction:
         system_prompt, contexts = await self._build_request_context(
             event=event,
             task_prompt=task_prompt,
+            prompt_has_time=has_time,
             contexts=contexts,
         )
 
@@ -393,12 +401,16 @@ class LLMAction:
                 content += f"\n[转发]\n{post.rt_con}"
 
             prompt = f"\n[帖子内容]：\n{content}"
+            task_prompt, has_time = self._build_task_prompt(
+                SCENE_COMMENT, self.cfg.llm.comment_prompt
+            )
             system_prompt, contexts = await self._build_request_context(
                 event=event,
                 task_prompt=self._join_prompt_parts(
-                    self._build_task_prompt(SCENE_COMMENT, self.cfg.llm.comment_prompt),
+                    task_prompt,
                     "# 输出要求：\n- 只输出最终评论内容，不要解释，不要分点，不要添加额外前缀。",
                 ),
+                prompt_has_time=has_time,
             )
 
             logger.debug(prompt)
@@ -451,12 +463,16 @@ class LLMAction:
 
             prompt = f"\n## 帖子内容\n{content}"
             prompt += f"\n## 要回复的评论\n{comment.nickname}：{comment.content}"
+            task_prompt, has_time = self._build_task_prompt(
+                SCENE_REPLY, self.cfg.llm.reply_prompt
+            )
             system_prompt, contexts = await self._build_request_context(
                 event=event,
                 task_prompt=self._join_prompt_parts(
-                    self._build_task_prompt(SCENE_REPLY, self.cfg.llm.reply_prompt),
+                    task_prompt,
                     "# 输出要求：\n- 只输出最终回复内容，不要解释，不要分点，不要添加额外前缀。",
                 ),
+                prompt_has_time=has_time,
             )
             logger.debug(prompt)
             llm_response = await provider.text_chat(
