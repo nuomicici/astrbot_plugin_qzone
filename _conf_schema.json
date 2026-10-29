@@ -16,10 +16,16 @@
                 "default": "",
                 "_special": "select_provider"
             },
-            "post_prompt": {
-                "description": "写说说用的llm提示词",
+            "main_prompt": {
+                "description": "全局主提示词",
                 "type": "text",
-                "hint": "强烈建议自行根据Bot人格进行改写, 从而达到更好的效果",
+                "hint": "所有场景（写说说 / 评论 / 回复）共享的主提示词，会与下方各场景的独立提示词拼接后一起发送给 LLM。强烈建议根据 Bot 人格进行改写。支持占位符：{current_time}（当前时间）、{scene}（当前场景）",
+                "default": "你是【Bot昵称】的QQ空间分身。当前时间：{current_time}\n请完全以你的人格说话，语气自然、口语化，像真实的人在刷空间。\n当前场景：{scene}"
+            },
+            "post_prompt": {
+                "description": "写说说用的专属提示词",
+                "type": "text",
+                "hint": "仅写说说场景使用，会拼接在全局主提示词之后。强烈建议自行根据Bot人格进行改写, 从而达到更好的效果",
                 "default": "## 找出一个你感兴趣的主题来写一句吐槽或感慨，注意精简"
             },
             "comment_provider_id": {
@@ -30,9 +36,9 @@
                 "_special": "select_provider"
             },
             "comment_prompt": {
-                "description": "评论说说用的llm提示词",
+                "description": "评论说说用的专属提示词",
                 "type": "text",
-                "hint": "强烈建议自行根据Bot人格进行改写, 从而达到更好的效果",
+                "hint": "仅评论场景使用，会拼接在全局主提示词之后。强烈建议自行根据Bot人格进行改写, 从而达到更好的效果",
                 "default": "生成一句简短、直接、贴题、犀利的评论, 不要解释、不做自我描述、不分选项"
             },
             "reply_provider_id": {
@@ -43,9 +49,9 @@
                 "_special": "select_provider"
             },
             "reply_prompt": {
-                "description": "回复评论用的llm提示词",
+                "description": "回复评论用的专属提示词",
                 "type": "text",
-                "hint": "强烈建议自行根据Bot人格进行改写, 从而达到更好的效果",
+                "hint": "仅回复场景使用，会拼接在全局主提示词之后。强烈建议自行根据Bot人格进行改写, 从而达到更好的效果",
                 "default": "这条帖子收到了一条评论，请回复此条评论, 不要解释、不做自我描述、不分选项"
             }
         }
@@ -77,6 +83,28 @@
                     "step": 10
                 },
                 "default": 500
+            },
+            "post_days": {
+                "description": "聊天记录回溯天数",
+                "type": "int",
+                "hint": "写说说时只取最近 N 天内（按日期）的聊天记录。设为 1 表示只取今天的，2 表示今天和昨天，以此类推",
+                "slider": {
+                    "min": 1,
+                    "max": 7,
+                    "step": 1
+                },
+                "default": 1
+            },
+            "group_session_pool": {
+                "description": "候选会话随机数量",
+                "hint": "未指定群聊时，会从可用会话池中随机抽取若干个群聊依次尝试；某个群聊在指定日期内没有聊天记录时，自动切换到下一个会话，直到取到聊天记录为止",
+                "type": "int",
+                "slider": {
+                    "min": 1,
+                    "max": 20,
+                    "step": 1
+                },
+                "default": 5
             }
         }
     },

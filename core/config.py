@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import zoneinfo
 from collections.abc import Mapping, MutableMapping
+from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType, UnionType
 from typing import Any, Union, get_args, get_origin, get_type_hints
@@ -115,6 +116,7 @@ class ConfigNode:
 
 class LLMConfig(ConfigNode):
     post_provider_id: str
+    main_prompt: str
     post_prompt: str
     comment_provider_id: str
     comment_prompt: str
@@ -126,6 +128,8 @@ class SourceConfig(ConfigNode):
     ignore_groups: list[str]
     ignore_users: list[str]
     post_max_msg: int
+    post_days: int
+    group_session_pool: int
 
     def __init__(self, data: MutableMapping[str, Any]):
         super().__init__(data)
@@ -186,6 +190,13 @@ class PluginConfig(ConfigNode):
         self.save_config()
 
         self.client: CQHttp | None = None
+
+    def now(self) -> datetime:
+        return datetime.now(self.timezone)
+
+    def now_str(self) -> str:
+        """当前时间字符串，用于填充提示词里的 {current_time} 占位符"""
+        return self.now().strftime("%Y-%m-%d %H:%M:%S %A")
 
     def _normalize_id(self):
         """仅保留纯数字ID"""

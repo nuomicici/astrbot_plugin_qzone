@@ -1,6 +1,7 @@
 import copy
 import random
 import re
+from datetime import datetime, timedelta
 from typing import Any
 
 from astrbot.api import logger
@@ -8,6 +9,19 @@ from astrbot.core.provider.provider import Provider
 
 from .config import PluginConfig
 from .model import Comment, Post
+
+SCENE_POST = "post"
+SCENE_COMMENT = "comment"
+SCENE_REPLY = "reply"
+
+SCENE_LABELS = {
+    SCENE_POST: "写说说",
+    SCENE_COMMENT: "评论说说",
+    SCENE_REPLY: "回复评论",
+}
+
+TIME_PLACEHOLDER = "{current_time}"
+SCENE_PLACEHOLDER = "{scene}"
 
 
 class LLMAction:
@@ -18,6 +32,25 @@ class LLMAction:
     @staticmethod
     def _join_prompt_parts(*parts: str) -> str:
         return "\n\n".join(part.strip() for part in parts if part and part.strip())
+
+    @staticmethod
+    def _msg_ts(msg: dict[str, Any]) -> int:
+        """取出一条 OneBot 消息的时间戳（秒）"""
+        for key in ("time", "timestamp", "send_time"):
+            value = msg.get(key)
+            try:
+                if value is not None:
+                    return int(value)
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    def _is_msg_in_days(self, msg: dict[str, Any], since: datetime) -> bool:
+        ts = self._msg_ts(msg)
+        if ts <= 0:
+            return True
+        msg_dt = datetime.fromtimestamp(ts, self.cfg.timezone)
+        return msg_dt >= since
 
     def _build_context(
         self, round_messages: list[dict[str, Any]]
@@ -38,9 +71,13 @@ class LLMAction:
                 contexts.append({"role": "user", "content": text})
         return contexts
 
-    async def _get_msg_contexts(self, group_id: str) -> list[dict]:
-        """获取群聊历史消息"""
+    async def _get_msg_contexts(
+        self, group_id: str, days: int | None = None
+    ) -> list[dict]:
+        """按日期回溯获取群聊历史消息，只保留最近 days 天内的内容"""
         message_seq = 0
+        days = max(1, days if days is not None else self.cfg.source.post_days)
+        since = self.cfg.now() - timedelta(days=days)
         contexts: list[dict] = []
         if not self.cfg.client:
             raise RuntimeError("客户端未初始化")
@@ -54,13 +91,69 @@ class LLMAction:
             result: dict = await self.cfg.client.api.call_action(
                 "get_group_msg_history", **payloads
             )
-            round_messages = result["messages"]
+            round_messages = result.get("messages") or []
             if not round_messages:
+                break
+
+            # 本批消息已回溯到指定日期之前，取完这一批里的有效消息即可结束
+            in_range = [
+                msg for msg in round_messages if self._is_msg_in_days(msg, since)
+            ]
+            contexts.extend(self._build_context(in_range))
+
+            if len(in_range) < len(round_messages):
                 break
             message_seq = round_messages[0]["message_id"]
 
-            contexts.extend(self._build_context(round_messages))
-        return contexts
+        return contexts[: self.cfg.source.post_max_msg]
+
+    async def _resolve_msg_contexts(
+        self, group_id: str = ""
+    ) -> tuple[str, list[dict], list[str]]:
+        """
+        确定用于写说说的聊天记录。
+
+        - 指定 group_id 时只取该会话；
+        - 否则随机抽取若干候选群聊，逐个尝试；某个会话在指定日期内没有聊天记录，
+          就切换到下一个会话，直到取到非空聊天记录为止。
+        返回 (实际使用的会话ID, 聊天记录, 尝试过的会话列表)
+        """
+        if not self.cfg.client:
+            raise RuntimeError("客户端未初始化")
+
+        tried: list[str] = []
+        if group_id:
+            tried.append(str(group_id))
+            return str(group_id), await self._get_msg_contexts(str(group_id)), tried
+
+        group_list = await self.cfg.client.get_group_list()
+        group_ids = [
+            str(group["group_id"])
+            for group in group_list
+            if str(group["group_id"]) not in self.cfg.source.ignore_groups
+        ]
+        if not group_ids:
+            return "", [], []
+
+        pool_size = max(1, min(int(self.cfg.source.group_session_pool), len(group_ids)))
+        candidates = random.sample(group_ids, pool_size)
+
+        for candidate in candidates:
+            tried.append(candidate)
+            try:
+                contexts = await self._get_msg_contexts(candidate)
+            except Exception as e:
+                logger.warning(f"获取群聊 {candidate} 的聊天记录失败，切换下一个会话: {e}")
+                continue
+            if contexts:
+                if len(tried) > 1:
+                    logger.info(
+                        f"前 {len(tried) - 1} 个会话在指定日期内无聊天记录，改用会话 {candidate}"
+                    )
+                return candidate, contexts, tried
+
+        logger.warning(f"候选会话在指定日期内均无聊天记录：{tried}")
+        return "", [], tried
 
     @staticmethod
     def _get_event_umo(event: Any | None) -> str | None:
@@ -150,8 +243,31 @@ class LLMAction:
             begin_dialogs = copy.deepcopy(persona.get("_begin_dialogs_processed") or [])
             return persona_prompt, begin_dialogs
         except Exception as e:
-            logger.warning(f"解析当前会话人格失败，将回退到插件默认任务提示词: {e}")
+            logger.warning(f"解析当前会话人格失败，将仅使用插件提示词: {e}")
             return "", []
+
+    def _render_prompt(self, text: str, scene: str) -> str:
+        """填充提示词占位符：{current_time} / {scene}"""
+        if not text:
+            return ""
+        return (
+            text.replace(TIME_PLACEHOLDER, self.cfg.now_str())
+            .replace(SCENE_PLACEHOLDER, SCENE_LABELS.get(scene, scene))
+            .strip()
+        )
+
+    def _build_task_prompt(
+        self, scene: str, scene_prompt: str, extra: str = ""
+    ) -> str:
+        """
+        统合提示词：[全局主提示词] + [当前场景独立提示词] + [可选场景附加要求]
+        每个场景只替换自己的独立提示词，主提示词始终共享。
+        """
+        return self._join_prompt_parts(
+            self._render_prompt(self.cfg.llm.main_prompt, scene),
+            self._render_prompt(scene_prompt, scene),
+            self._render_prompt(extra, scene),
+        )
 
     async def _build_request_context(
         self,
@@ -164,6 +280,7 @@ class LLMAction:
         system_prompt = self._join_prompt_parts(
             "# Persona Instructions\n\n" + persona_prompt if persona_prompt else "",
             task_prompt,
+            f"# 当前时间\n{self.cfg.now_str()}",
         )
         merged_contexts = [*persona_contexts]
         if contexts:
@@ -195,25 +312,19 @@ class LLMAction:
         if not self.cfg.client:
             raise RuntimeError("客户端未初始化")
 
-        if group_id:
-            contexts = await self._get_msg_contexts(group_id)
-        else:  # 随机获取一个群组
-            group_list = await self.cfg.client.get_group_list()
-            group_ids = [
-                str(group["group_id"])
-                for group in group_list
-                if str(group["group_id"]) not in self.cfg.source.ignore_groups
-            ]
-            if not group_ids:
-                logger.warning("未找到可用群组")
-                return None
-            group_id = random.choice(group_ids)
-            contexts = await self._get_msg_contexts(group_id)
+        group_id, contexts, _ = await self._resolve_msg_contexts(group_id)
+        if not contexts:
+            logger.warning("选定的会话没有可用于写说说的聊天记录")
+            return None
         # TODO: 更多模式
 
-        task_prompt = self._join_prompt_parts(
-            f"# 写作主题：{topic or '从聊天内容中选一个主题'}",
+        task_prompt = self._build_task_prompt(
+            SCENE_POST,
             self.cfg.llm.post_prompt,
+            f"# 写作主题：{topic or '从聊天内容中选一个主题'}",
+        )
+        task_prompt = self._join_prompt_parts(
+            task_prompt,
             "# 输出格式要求：\n"
             '- 使用三对双引号（"""）将正文内容包裹起来。\n'
             "- 只输出最终可发布的说说正文，不要附带解释、标题或额外说明。",
@@ -257,7 +368,7 @@ class LLMAction:
             system_prompt, contexts = await self._build_request_context(
                 event=event,
                 task_prompt=self._join_prompt_parts(
-                    self.cfg.llm.comment_prompt,
+                    self._build_task_prompt(SCENE_COMMENT, self.cfg.llm.comment_prompt),
                     "# 输出要求：\n- 只输出最终评论内容，不要解释，不要分点，不要添加额外前缀。",
                 ),
             )
@@ -315,7 +426,7 @@ class LLMAction:
             system_prompt, contexts = await self._build_request_context(
                 event=event,
                 task_prompt=self._join_prompt_parts(
-                    self.cfg.llm.reply_prompt,
+                    self._build_task_prompt(SCENE_REPLY, self.cfg.llm.reply_prompt),
                     "# 输出要求：\n- 只输出最终回复内容，不要解释，不要分点，不要添加额外前缀。",
                 ),
             )
