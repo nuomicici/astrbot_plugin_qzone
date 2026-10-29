@@ -98,7 +98,10 @@ class LLMAction:
         contexts: list[dict] = []
         if not self.cfg.client:
             raise RuntimeError("客户端未初始化")
-        while len(contexts) < self.cfg.source.post_max_msg:
+        max_pages = 20
+        pages = 0
+        while len(contexts) < self.cfg.source.post_max_msg and pages < max_pages:
+            pages += 1
             payloads = {
                 "group_id": group_id,
                 "message_seq": message_seq,
@@ -120,7 +123,11 @@ class LLMAction:
 
             if len(in_range) < len(round_messages):
                 break
-            message_seq = round_messages[0]["message_id"]
+
+            new_seq = round_messages[0].get("message_id")
+            if not new_seq or new_seq == message_seq:
+                break
+            message_seq = new_seq
 
         # 分页是从新到旧拉取，合起来整体是倒序；反转后按时间正序，
         # 再保留末尾（即最近）的 post_max_msg 条，确保截断丢掉的是最旧的消息
