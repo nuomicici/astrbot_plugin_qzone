@@ -28,20 +28,28 @@ class LLMAction:
     def __init__(self, config: PluginConfig):
         self.cfg = config
         self.context = config.context
+        self._prompt_has_time = False
 
     @staticmethod
     def _join_prompt_parts(*parts: str) -> str:
         return "\n\n".join(part.strip() for part in parts if part and part.strip())
 
     @staticmethod
+    def _normalize_ts(ts: int) -> int:
+        """把毫秒级时间戳归一化为秒级，避免 fromtimestamp 溢出"""
+        if ts > 10_000_000_000:
+            return ts // 1000
+        return ts
+
+    @staticmethod
     def _msg_ts(msg: dict[str, Any]) -> int:
-        """取出一条 OneBot 消息的时间戳（秒）"""
+        """取出一条 OneBot 消息的时间戳（统一为秒）"""
         for key in ("time", "timestamp", "send_time"):
             value = msg.get(key)
             try:
                 if value is not None:
-                    return int(value)
-            except (TypeError, ValueError):
+                    return LLMAction._normalize_ts(int(value))
+            except (TypeError, ValueError, OverflowError):
                 continue
         return 0
 
@@ -49,26 +57,33 @@ class LLMAction:
         ts = self._msg_ts(msg)
         if ts <= 0:
             return True
-        msg_dt = datetime.fromtimestamp(ts, self.cfg.timezone)
+        try:
+            msg_dt = datetime.fromtimestamp(ts, self.cfg.timezone)
+        except (ValueError, OSError, OverflowError):
+            return True
         return msg_dt >= since
 
+    @staticmethod
     def _build_context(
-        self, round_messages: list[dict[str, Any]]
+        round_messages: list[dict[str, Any]]
     ) -> list[dict[str, str]]:
         """
         把所有回合里的纯文本消息打包成 openai-style 的 user 上下文。
+        只有存在非空文本片段的消息才会保留，避免把只含图片/表情的消息当成有效内容。
         """
         contexts: list[dict[str, str]] = []
         for msg in round_messages:
-            # 提取并拼接所有 text 片段
             text_segments = [
-                seg["data"]["text"] for seg in msg["message"] if seg["type"] == "text"
+                str(seg.get("data", {}).get("text") or "")
+                for seg in msg.get("message") or []
+                if seg.get("type") == "text"
             ]
-
-            text = f"{msg['sender']['nickname']}: {''.join(text_segments).strip()}"
+            text = "".join(text_segments).strip()
             # 仅当真正说了话才保留
-            if text:
-                contexts.append({"role": "user", "content": text})
+            if not text:
+                continue
+            nickname = (msg.get("sender") or {}).get("nickname") or "未知用户"
+            contexts.append({"role": "user", "content": f"{nickname}: {text}"})
         return contexts
 
     async def _get_msg_contexts(
@@ -77,7 +92,10 @@ class LLMAction:
         """按日期回溯获取群聊历史消息，只保留最近 days 天内的内容"""
         message_seq = 0
         days = max(1, days if days is not None else self.cfg.source.post_days)
-        since = self.cfg.now() - timedelta(days=days)
+        # 以本地零点为锚点：days=1 表示今天，days=2 表示今天+昨天
+        now = self.cfg.now()
+        start_of_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        since = start_of_today - timedelta(days=days - 1)
         contexts: list[dict] = []
         if not self.cfg.client:
             raise RuntimeError("客户端未初始化")
@@ -105,7 +123,10 @@ class LLMAction:
                 break
             message_seq = round_messages[0]["message_id"]
 
-        return contexts[: self.cfg.source.post_max_msg]
+        # 分页是从新到旧拉取，合起来整体是倒序；反转后按时间正序，
+        # 再保留末尾（即最近）的 post_max_msg 条，确保截断丢掉的是最旧的消息
+        contexts.reverse()
+        return contexts[-self.cfg.source.post_max_msg :]
 
     async def _resolve_msg_contexts(
         self, group_id: str = ""
@@ -263,6 +284,10 @@ class LLMAction:
         统合提示词：[全局主提示词] + [当前场景独立提示词] + [可选场景附加要求]
         每个场景只替换自己的独立提示词，主提示词始终共享。
         """
+        self._prompt_has_time = any(
+            TIME_PLACEHOLDER in (part or "")
+            for part in (self.cfg.llm.main_prompt, scene_prompt, extra)
+        )
         return self._join_prompt_parts(
             self._render_prompt(self.cfg.llm.main_prompt, scene),
             self._render_prompt(scene_prompt, scene),
@@ -277,11 +302,14 @@ class LLMAction:
         contexts: list[dict[str, Any]] | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
         persona_prompt, persona_contexts = await self._get_persona_context(event)
-        system_prompt = self._join_prompt_parts(
+        parts = [
             "# Persona Instructions\n\n" + persona_prompt if persona_prompt else "",
             task_prompt,
-            f"# 当前时间\n{self.cfg.now_str()}",
-        )
+        ]
+        # 提示词里已经有时间占位符时不再追加，避免当前时间被重复声明
+        if not self._prompt_has_time:
+            parts.append(f"# 当前时间\n{self.cfg.now_str()}")
+        system_prompt = self._join_prompt_parts(*parts)
         merged_contexts = [*persona_contexts]
         if contexts:
             merged_contexts.extend(contexts)
