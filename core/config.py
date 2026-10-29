@@ -195,8 +195,8 @@ class PluginConfig(ConfigNode):
         return datetime.now(self.timezone)
 
     def now_str(self) -> str:
-        """当前时间字符串，用于填充提示词里的 {current_time} 占位符"""
-        return self.now().strftime("%Y-%m-%d %H:%M:%S %A")
+        """当前时间字符串（年月日 + 24小时制），用于填充提示词里的 {current_time} 占位符"""
+        return self.now().strftime("%Y年%m月%d日 %H:%M:%S")
 
     def _normalize_id(self):
         """仅保留纯数字ID"""
